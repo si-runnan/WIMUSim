@@ -10,6 +10,296 @@ from torch.utils.data.dataset import Dataset
 from wimusim.wimusim import WIMUSim
 from wimusim.wimusim import utils
 
+import warnings
+from typing import List, Dict
+from collections import defaultdict
+import random
+import itertools
+from tqdm import tqdm
+import torch
+from torch.utils.data.dataset import Dataset
+import numpy as np
+from wimusim.wimusim import WIMUSim
+from wimusim.wimusim import utils
+
+
+class WIMUSimDataset(Dataset):
+    def __init__(
+        self,
+        B_list: List[WIMUSim.Body],
+        D_list: List[WIMUSim.Dynamics],
+        P_list: List[WIMUSim.Placement],
+        H_list: List[WIMUSim.Hardware],
+        window: int,
+        stride: int,
+        acc_only: bool = False,
+        gyro_only: bool = False,
+        target_list: List[torch.Tensor] = None,
+        groups: List = None,  # Optionally used to group the parameters for sampling
+        device: torch.device = None,
+        dataset_type="supervised",
+        data_order="alternate",
+        scale_config: Dict = None,
+    ):
+        """
+        :param B_list: List of B matrices
+        :param dataset_type: when type is supervised, target_list must be provided
+        """
+        self.window = window
+        self.stride = stride
+
+        # Check if CUDA is available
+        # Set this before setting the wimusim parameters
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            else:
+                self.device = torch.device("cpu")
+        else:
+            self.device = device
+
+        self._len = None
+        self._target = None
+        self._index_range_dict = None
+        self._scale_config = scale_config
+        self._D_data_list = None  # To be set in the D_list setter
+
+        self.B_list = B_list
+        self.D_list = D_list
+        self.P_list = P_list
+        self.H_list = H_list
+        self.target_list = target_list
+
+        self.acc_only = acc_only
+        self.gyro_only = gyro_only
+        self.data_order = data_order
+
+        self.groups = groups  # Dict["B": List of len(B_list), "D": List of len(D_list), "P": List of len(P_list), "H": List of len(H_list)]
+
+        # NOTE: Possibly add a list of columns names for the dataset. It would be useful.
+        # self.col_names = []
+
+        self.dataset_type = dataset_type  # supervised or unsupervised
+
+        self._check_parameters()  # validate the parameters
+        self._disable_grad()
+
+    def _check_parameters(self):
+        """
+        Check if the parameters are valid. Also check if all the tensors are on the same device.
+
+        :return:
+        """
+        for B in self.B_list:
+            assert (
+                type(B) == WIMUSim.Body
+            ), "B_list's elements must be of type WIMUSim.Body"
+            assert B.device == self.device
+
+        for D in self.D_list:
+            assert (
+                type(D) == WIMUSim.Dynamics
+            ), "D_list's elements must be of type WIMUSim.Dynamics"
+            assert D.device == self.device
+
+        for P in self.P_list:
+            assert (
+                type(P) == WIMUSim.Placement
+            ), "P_list's elements must be of type WIMUSim.Placement"
+            assert P.device == self.device
+
+        for H in self.H_list:
+            assert (
+                type(H) == WIMUSim.Hardware
+            ), "H_list's elements must be of type WIMUSim.Hardware"
+            assert H.device == self.device
+
+        if self.groups is not None:
+            assert len(self.groups) == len(
+                self.D_list
+            ), "Number of groups must be the same as number of B matrices"
+            assert all(
+                [group in range(len(self.B_list)) for group in self.groups]
+            ), "All groups must be in range of B matrices"
+
+        if self.dataset_type == "supervised":
+            assert (
+                self.target_list is not None
+            ), "Target list must be provided for supervised dataset"
+            assert len(self.D_list) == len(
+                self.target_list
+            ), "Length of D_list and target_list must be the same"
+
+            for i, (D, target) in enumerate(zip(self.D_list, self.target_list)):
+                assert (
+                    D.n_samples == target.shape[0]
+                ), f"Number of samples in D_list[{i}] and target_list[{i}] must be the same"
+
+    def _disable_grad(self):
+        """
+        Disable the gradient computation for all the parameters
+        :return:
+        """
+        for B in self.B_list:
+            for b in B.rp.values():
+                b.requires_grad_(False)
+        for D in self.D_list:
+            for d in D.translation.values():
+                d.requires_grad_(False)
+            for d in D.orientation.values():
+                d.requires_grad_(False)
+        for P in self.P_list:
+            for p in P.rp.values():
+                p.requires_grad_(False)
+            for p in P.ro.values():
+                p.requires_grad_(False)
+        for H in self.H_list:
+            for h in H.ba.values():
+                h.requires_grad_(False)
+            for key, h in H.sa.items():
+                # h.requires_grad_(False)  # Didn't work somehow (?)
+                H.sa[key] = (
+                    torch.Tensor(h.detach()).to(self.device).requires_grad_(False)
+                )
+            for h in H.bg.values():
+                h.requires_grad_(False)
+            for key, h in H.sg.items():
+                H.sg[key] = (
+                    torch.Tensor(h.detach()).to(self.device).requires_grad_(False)
+                )
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx, scale: float = 1.0):
+        """
+        Return a slice of the D param and the target at the given index
+        :param idx: index of the data
+        :param scale: Only for TimeScaling augmentation
+        :return: (data, target, (idx, list_idx))
+        """
+
+        for list_idx, idx_range in self._index_range_dict.items():
+            if idx in idx_range:
+                local_idx = idx - idx_range[0]
+                start = local_idx * self.stride
+                end = start + self.window
+                target = self._get_label(list_idx, start, end, scheme="max")
+                if scale != 1.0:
+                    window_scaled = int(self.window * scale)
+                    start_scaled = end - window_scaled
+                    if start_scaled < 0:
+                        # Handle the case where start is negative
+                        padding_size = abs(start_scaled)
+                        data = self._D_data_list[list_idx][:, 0:end, :]
+                        left_pad = data[:, :padding_size, :].flip(
+                            dims=[1]
+                        )  # Reflect the first `padding_size` columns
+                        data = torch.cat((left_pad, data), dim=1)
+                    else:
+                        data = self._D_data_list[list_idx][:, start_scaled:end, :]
+                else:
+                    data = self._D_data_list[list_idx][
+                           :, start:end, :
+                           ]  # D_data: [1+J, T, 4]
+                return data, target, (idx, list_idx)
+
+        # If the index is out of range
+        raise ValueError("Index out of range")
+
+    @property
+    def D_list(self):
+        if self._D_list is None:
+            raise ValueError("Data is not set yet")
+        else:
+            # Perform validation or processing if needed
+            pass
+        return self._D_list
+
+    @D_list.setter
+    def D_list(self, new_D_list):
+        """
+        Set the new value of D_list and update the length of the dataset.
+        Also, set the _D_data_list to make it more efficient to access the data.
+        :param new_D_list:
+        :return:
+        """
+        # Optionally, add validation for the new value here
+
+        idx_range_dict: Dict[int, range] = {}
+        for i in range(len(new_D_list)):
+            prev_end = 0 if i == 0 else idx_range_dict[i - 1][-1]
+            data_i_n_windows = (
+                new_D_list[i].n_samples - self.window
+            ) // self.stride + 1
+            if i == 0:
+                idx_range_dict[i] = range(prev_end, prev_end + data_i_n_windows)
+            else:
+                idx_range_dict[i] = range(prev_end + 1, prev_end + data_i_n_windows)
+            self.len = prev_end + data_i_n_windows  # Update the length of the dataset
+
+        # Update the range of the last element to include the last index
+        idx_range_dict[len(new_D_list) - 1] = range(
+            idx_range_dict[len(new_D_list) - 1][0],
+            idx_range_dict[len(new_D_list) - 1][-1] + 2,
+        )
+
+        self._D_list = new_D_list
+        self._len = idx_range_dict[len(self._D_list) - 1][-1] - 1
+        self._index_range_dict = idx_range_dict
+
+        # Set _D_data_list
+        self._D_ori_keys = list(self._D_list[0].orientation.keys())
+        self._D_ori_key_idx = {
+            key: i + 1 for i, key in enumerate(self._D_ori_keys)
+        }  # Translation is at index 0
+
+        self._D_data_list = [
+            torch.zeros(
+                (len(D.orientation.keys()) + 1, D.n_samples, 4), device=self.device
+            )
+            for D in self.D_list
+        ]
+        for i, D in enumerate(self.D_list):
+            self._D_data_list[i][0, :, 1:4] = D.translation["XYZ"]  # WXYZ format
+            self._D_data_list[i][1:, :, :] = torch.stack(
+                [D.orientation[key] for key in self._D_ori_keys]
+            )
+
+    @property
+    def len(self):
+        return self._len
+
+    @len.setter
+    def len(self, new_len):
+        self._len = new_len
+
+    @property
+    def target(self):
+        return self._target
+
+    @target.setter
+    def target(self, new_target):
+        self._target = new_target
+
+    @property
+    def scale_config(self):
+        return self._scale_config
+
+    @scale_config.setter
+    def scale_config(self, new_scale_config):
+        print("Setting scale config:", new_scale_config)
+        self._scale_config = new_scale_config
+
+    def _get_label(self, list_idx, start, end, scheme="max"):
+        if scheme == "last":
+            return self.target_list[list_idx][end - 1]
+
+        elif scheme == "max":
+            return np.argmax(np.bincount(self.target_list[list_idx][start:end]))
+
+        else:
+            raise ValueError(f"Unknown scheme {scheme}.")
 
 class CPM(Dataset):
 
@@ -44,8 +334,6 @@ class CPM(Dataset):
         self.acc_only = acc_only
         self.gyro_only = gyro_only
 
-        # Groupingの仕様はもう少し考える。基本的には、最終的なClassのバランスを揃えることができるようにしたい。
-        # だから、Dynamicsのパラメータに対してだけGroupを指定できるようにするだけでも良いかもしれない。
         self.groups = groups  # Dict["B": List of len(B_list), "D": List of len(D_list), "P": List of len(P_list), "H": List of len(H_list)]
 
         self._len = None
