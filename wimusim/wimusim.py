@@ -14,7 +14,6 @@ import torch
 
 from wimusim import consts as c
 from wimusim import utils
-from dataset_configs.h36m import consts as h36m_consts
 from dataset_configs.smpl import consts as smpl_consts
 
 
@@ -684,7 +683,7 @@ class WIMUSim:
         H,
         E=Environment(),
         device=None,
-        dataset_name: Literal["H3.6M", "RealWorld", "SMPL", None] = None,
+        dataset_name: Literal["SMPL", None] = None,
         realtime_sim=False,
         enable_translation=True,
         visualization_prec_level=25,
@@ -758,16 +757,10 @@ class WIMUSim:
         _default_imu_size = np.array([0.058, 0.058, 0.033])
         _default_imu_color = (249 / 255, 105 / 255, 14 / 255, 1.0)
 
-        if dataset_name == "SMPL":
-            self.joint_link_dict = smpl_consts.JOINT_WIMUSIM_LINK_DICT
-        else:
-            self.joint_link_dict = h36m_consts.JOINT_WIMUSIM_LINK_DICT
+        self.joint_link_dict = smpl_consts.JOINT_WIMUSIM_LINK_DICT
         self.imu_sizes = [_default_imu_size for _ in self.P.imu_names]
         self.imu_colors = [_default_imu_color for _ in self.P.imu_names]
-        if dataset_name == "H3.6M":
-            self.sampling_rate = 30  # 30 Hz
-        else:
-            self.sampling_rate = self.D.sample_rate
+        self.sampling_rate = self.D.sample_rate
 
         self.timestep = 1.0 / self.sampling_rate / self.visualization_prec_level
 
@@ -873,49 +866,7 @@ class WIMUSim:
         convert_B_and_P
         :return:
         """
-        if self.dataset_name == "SMPL":
-            self._convert_BP_smpl()
-        else:
-            self._convert_BP_h36m()
-
-    def _convert_BP_h36m(self):
-        """Humanoid param conversion for H3.6M / RealWorld joint names."""
-        # B params
-        self.humanoid_params["torso_1"]["length"] = self.B.rp[("PELVIS", "BELLY")][2]
-        self.humanoid_params["torso_2"]["length"] = self.B.rp[("BELLY", "NECK")][2]
-        self.humanoid_params["right_clavicle"]["length"] = self.B.rp[
-            ("R_CLAVICLE", "R_SHOULDER")
-        ][0]
-        self.humanoid_params["right_upperarm"]["length"] = self.B.rp[
-            ("R_SHOULDER", "R_ELBOW")
-        ][0]
-        self.humanoid_params["right_lowerarm"]["length"] = self.B.rp[
-            ("R_ELBOW", "R_WRIST")
-        ][0]
-        self.humanoid_params["left_clavicle"]["length"] = -self.B.rp[
-            ("L_CLAVICLE", "L_SHOULDER")
-        ][0]
-        self.humanoid_params["left_upperarm"]["length"] = -self.B.rp[
-            ("L_SHOULDER", "L_ELBOW")
-        ][0]
-        self.humanoid_params["left_lowerarm"]["length"] = -self.B.rp[
-            ("L_ELBOW", "L_WRIST")
-        ][0]
-        self.humanoid_params["pelvis"]["length"] = (
-            self.B.rp[("BASE", "R_HIP")][0] - self.B.rp[("BASE", "L_HIP")][0]
-        ) * 1.5
-        self.humanoid_params["right_upperleg"]["length"] = -self.B.rp[
-            ("R_HIP", "R_KNEE")
-        ][2]
-        self.humanoid_params["right_lowerleg"]["length"] = -self.B.rp[
-            ("R_KNEE", "R_ANKLE")
-        ][2]
-        self.humanoid_params["left_upperleg"]["length"] = -self.B.rp[
-            ("L_HIP", "L_KNEE")
-        ][2]
-        self.humanoid_params["left_lowerleg"]["length"] = -self.B.rp[
-            ("L_KNEE", "L_ANKLE")
-        ][2]
+        self._convert_BP_smpl()
 
     def _convert_BP_smpl(self):
         """Humanoid param conversion for SMPL joint names.
