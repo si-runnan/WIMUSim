@@ -100,7 +100,6 @@ DEFAULT_LINK_INFO = {
 }
 
 # Related to visualization with PyBullet
-# TODO: This should be moved to realdisp.consts
 IMU_PARAMS_DEFAULT = ["BACK", "RUA", "RLA", "LUA", "LLA", "RT", "RC", "LT", "LC"]
 
 ROM_RANGE_ADJ = [-20, 20]  # ADJ: Adjustment\

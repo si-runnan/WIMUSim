@@ -14,9 +14,6 @@ import torch
 
 from wimusim import consts as c
 from wimusim import utils
-#
-from dataset_configs.digit_drawing_dataset import consts as digit_consts
-from dataset_configs.realdisp import consts as realdisp_consts
 from dataset_configs.h36m import consts as h36m_consts
 
 
@@ -686,9 +683,7 @@ class WIMUSim:
         H,
         E=Environment(),
         device=None,
-        dataset_name: Literal[
-            "H3.6M", "REALDISP", "DigitDrawingDataset", "RealWorld"
-        ] = None,
+        dataset_name: Literal["H3.6M", "RealWorld", None] = None,
         realtime_sim=False,
         enable_translation=True,
         visualization_prec_level=25,
@@ -755,66 +750,20 @@ class WIMUSim:
 
         self.simulated_IMU_dict: dict = {}  # IMU name -> simulated IMU (acc, gyro)
 
-        # TODO: Change this somehow. Current implementation are too dataset specific
-        if dataset_name is not None:
-            # Show warning that dataset_name is to be removed
-            warnings.warn("dataset_name is to be removed", UserWarning)
+        # IMU names come from the Placement parameter
+        self.imu_names = self.P.imu_names
 
-        if dataset_name == "DigitDrawingDataset":
-            # Show warning
+        # Default IMU visualization parameters (XSENS-style)
+        _default_imu_size = np.array([0.058, 0.058, 0.033])
+        _default_imu_color = (249 / 255, 105 / 255, 14 / 255, 1.0)
 
-            # The joint pairs of the humanoid (This should be given by Body)
-            self.joint_child_parent_pairs = digit_consts.JOINT_CHILD_PARENT_PAIRS
-            # Note: From now on, switch to self.B.child_parent_pairs as much as possible
-
-            assert self.B.child_parent_pairs == self.joint_child_parent_pairs
-            # These params are required for placing IMUs on the humanoid
-            self.imu_names = digit_consts.IMU_NAMES
-            self.imu_sizes = digit_consts.IMU_SIZES
-            self.imu_colors = digit_consts.IMU_COLORS
-            self.joint_link_dict = digit_consts.JOINT_WIMUSIM_LINK_DICT
-
-            # The step size of the simulation p.stepSimulation()
-            self.sampling_rate = digit_consts.SAMPLING_RATE
-
-            self.joint_imu_pairs = digit_consts.JOINT_IMU_PAIRS
-
-        elif dataset_name == "REALDISP":
-            # These params are required for placing IMUs on the humanoid
-            self.imu_names = realdisp_consts.IMU_NAMES  # This should be given by P
-            self.imu_sizes = realdisp_consts.IMU_SIZES
-            self.imu_colors = realdisp_consts.IMU_COLORS
-            self.joint_link_dict = realdisp_consts.JOINT_WIMUSIM_LINK_DICT
-
-            # The step size of the simulation p.stepSimulation()
-            self.sampling_rate = realdisp_consts.SAMPLING_RATE
-
-            self.joint_imu_pairs = realdisp_consts.JOINT_IMU_PAIRS
-
-            # TODO: Check if the D params are in quaternion for REALDISP
-
-        elif dataset_name == "H3.6M":
-            self.joint_link_dict = h36m_consts.JOINT_WIMUSIM_LINK_DICT  #
+        self.joint_link_dict = h36m_consts.JOINT_WIMUSIM_LINK_DICT
+        self.imu_sizes = [_default_imu_size for _ in self.P.imu_names]
+        self.imu_colors = [_default_imu_color for _ in self.P.imu_names]
+        if dataset_name == "H3.6M":
             self.sampling_rate = 30  # 30 Hz
-            self.imu_sizes = realdisp_consts.IMU_SIZES
-            self.imu_colors = realdisp_consts.IMU_COLORS
-            warnings.warn(
-                "H3.6M dataset is not configured yet. May not work at some point",
-                UserWarning,
-            )
         else:
-            self.joint_link_dict = h36m_consts.JOINT_WIMUSIM_LINK_DICT  #
-            self.imu_sizes = realdisp_consts.IMU_SIZES
-            self.imu_colors = realdisp_consts.IMU_COLORS
-
-            #
-            self.sampling_rate = self.D.sample_rate  # 30 Hz
-
-            # raise ValueError("Invalid dataset_name", dataset_name)
-            # warnings.warn(
-            #     "Dataset name is not given. Use default humanoid model for PyBullet.",
-            #     UserWarning,
-            # )
+            self.sampling_rate = self.D.sample_rate
 
         self.timestep = 1.0 / self.sampling_rate / self.visualization_prec_level
 
@@ -858,16 +807,7 @@ class WIMUSim:
 
         self.pybullet_client_id = p.connect(p.GUI)
         p.setGravity(*self.E.g)
-        if self.dataset_name == "REALDISP":
-            self.convert_BP_to_humanoid_params()
-        elif self.dataset_name == "DigitDrawingDataset":
-            self.set_humanoid_params()
-            print("Use default humanoid params.")
-        elif self.dataset_name == "H3.6M":
-            self.convert_BP_to_humanoid_params()
-        else:
-            self.convert_BP_to_humanoid_params()
-            # raise ValueError("Invalid dataset_name", self.dataset_name)
+        self.convert_BP_to_humanoid_params()
 
         # Deploy the humanoid in the PyBullet environment
         self.deploy_humanoid()
