@@ -1,8 +1,6 @@
 import numpy as np
 from collections import OrderedDict
 
-DATASET_NAMES = ["DigitDrawingDataset", "REALDISP"]
-
 QUAT_NUMPY_FORMAT = ("W", "X", "Y", "Z")
 QUAT_MATLAB_FORMAT = QUAT_NUMPY_FORMAT  # a + bi + cj + dk
 QUAT_PYTORCH3D_FORMAT = QUAT_NUMPY_FORMAT
@@ -17,7 +15,6 @@ ORI_DEFAULT = (0.0, 0.0, 0.0, 1.0)  # Unit quaternion in XYZW format
 E_DEFAULT = {"g": np.array([0, 0, -9.8])}
 
 # default body params (unit: m)
-# This is for DigitDrawingDataset
 B_DEFAULT = {
     "rp": {
         "world2pelvis": np.array([0.0, 0.0, 0.0]),
