@@ -273,12 +273,14 @@ class SimulatorDataset(Dataset):
                         device=device_,
                     )
 
+                    from dataset_configs.movi.consts import SMPL_SAMPLE_RATE
                     orientation = smpl_pose_to_D_orientation(global_orient, body_pose)
                     D = WIMUSim.Dynamics(
                         orientation={
                             k: torch.tensor(v, dtype=torch.float32, device=device_)
                             for k, v in orientation.items()
                         },
+                        sample_rate=SMPL_SAMPLE_RATE,
                         device=device_,
                     )
 
@@ -292,7 +294,7 @@ class SimulatorDataset(Dataset):
                             if k[1] in imu_names},
                         device=device_,
                     )
-                    H = wu.generate_default_H_configs(imu_names, device=device_)
+                    H = wu.generate_default_H_configs(imu_names)
 
                     sequences.append((D, real_imu_dict, B, P, H))
 
