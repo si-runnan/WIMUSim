@@ -170,7 +170,14 @@ acc_LLA, gyro_LLA = virtual_IMU_dict["LLA"]  # torch.Tensor (T, 3)
 
 ### Training — MoVi
 
-90 subjects × 21 activities × 1 take each. SMPL fits (AMASS BMLmovi) + Vicon kinematics (v3d).
+90 subjects × 21 activities × 1 take each. Two complementary sources are required — they describe the **same motion** but serve different roles in training:
+
+| Source | File | Role in training |
+|--------|------|-----------------|
+| AMASS BMLmovi | `Subject_N_F_seq_poses.npz` | SMPL body parameters → WIMUSim physics → **virtual IMU** (model input) |
+| MoVi v3d Vicon | `F_v3d_Subject_N.mat` | Raw segment trajectories → differentiate → **real IMU** (training target) |
+
+The neural network learns to correct the gap between the two: `real_IMU ≈ virtual_IMU + NN(pose, virtual_IMU)`.
 
 Download:
 - AMASS BMLmovi: https://amass.is.tue.mpg.de/ → BMLmovi subset
