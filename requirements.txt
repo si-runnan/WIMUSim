@@ -1,0 +1,41 @@
+# WIMUSim — SMPL branch dependencies
+# Install core deps first:
+#   pip install -r requirements.txt
+#
+# Then install torch + pytorch3d via conda (recommended):
+#   conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 \
+#       pytorch-cuda=11.8 -c pytorch -c nvidia
+#   conda install -c fvcore -c iopath -c conda-forge fvcore iopath
+#   conda install pytorch3d -c pytorch3d
+#
+# For video → SMPL (optional, only needed for pipeline/video_to_smpl.py):
+#   pip install git+https://github.com/shubham-goel/4D-Humans.git
+#   pip install git+https://github.com/facebookresearch/detectron2.git
+
+# Core scientific stack
+numpy>=1.23.0
+scipy>=1.10.0
+pandas>=1.5.0
+
+# Deep learning (installed separately via conda — see above)
+torch>=2.0.0
+torchvision>=0.15.0
+pytorch3d>=0.7.5
+
+# SMPL body model
+smplx>=0.1.28
+
+# Optimization logging
+wandb>=0.15.0
+tqdm>=4.65.0
+
+# Visualization
+matplotlib>=3.7.0
+pybullet>=3.2.5
+
+# Notebook
+jupyterlab>=3.6.0
+nbformat>=5.9.0
+
+# Testing
+pytest>=7.0.0
