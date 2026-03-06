@@ -165,8 +165,10 @@ def main():
     parser.add_argument("--smpl_model", required=True,
                         help="Path to SMPL model directory")
     parser.add_argument("--output",     default="output/corrected_imu.npz")
-    parser.add_argument("--stride",     type=int, default=32)
-    parser.add_argument("--device",     default="cuda")
+    parser.add_argument("--stride",       type=int,   default=32)
+    parser.add_argument("--sample_rate", type=float, default=60.0,
+                        help="SMPL pose sample rate in Hz (default: 60)")
+    parser.add_argument("--device",      default="cuda")
     parser.add_argument("--gender",     default="neutral",
                         choices=["neutral", "male", "female"])
     args = parser.parse_args()
@@ -193,18 +195,26 @@ def main():
         return {k: torch.tensor(v, dtype=torch.float32, device=device)
                 for k, v in d.items()}
 
-    B = WIMUSim.Body(rp=_to_tensor(B_rp), device=device)
-    D = WIMUSim.Dynamics(orientation=_to_tensor(orientation), device=device)
-
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     imu_names = ckpt["config"]["imu_names"]
+
+    B = WIMUSim.Body(rp=_to_tensor(B_rp), device=device)
+    D = WIMUSim.Dynamics(
+        orientation=_to_tensor(orientation),
+        sample_rate=args.sample_rate,
+        device=device,
+    )
     P_all = generate_default_placement_params(B_rp)
     P = WIMUSim.Placement(
         rp=_to_tensor({k: v for k, v in P_all["rp"].items() if k[1] in imu_names}),
         ro=_to_tensor({k: v for k, v in P_all["ro"].items() if k[1] in imu_names}),
         device=device,
     )
-    H = wu.generate_default_H_configs(imu_names, device=device)
+    _H = wu.generate_default_H_configs(imu_names)
+    H = WIMUSim.Hardware(
+        ba=_H["ba"], bg=_H["bg"], sa=_H["sa"], sg=_H["sg"],
+        sa_range_dict=_H["sa_range_dict"], sg_range_dict=_H["sg_range_dict"],
+    )
 
     print("Running corrected simulation...")
     imu_dict = corrected_simulate(

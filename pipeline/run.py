@@ -153,7 +153,7 @@ def run(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="WIMUSim: Video → Virtual IMU data (SMPL pipeline)"
+        description="PhyNeSim: Video → Virtual IMU data"
     )
     parser.add_argument("--video",       required=True,  help="Path to input video")
     parser.add_argument("--smpl_model",  required=True,  help="Path to SMPL model directory (contains SMPL_NEUTRAL.pkl)")

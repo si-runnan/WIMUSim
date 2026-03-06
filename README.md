@@ -78,7 +78,9 @@ path/to/smpl/models/
 
 ---
 
-## Quickstart: Video → Virtual IMU
+## Three Commands
+
+**1. Video → Virtual IMU (physics simulation)**
 
 ```bash
 python pipeline/run.py \
@@ -87,6 +89,35 @@ python pipeline/run.py \
     --imu          LLA RLA LSH RSH PELV \
     --output       output/imu_data.npz \
     --csv
+```
+
+**2. Train the neural residual corrector (on MoVi)**
+
+```bash
+python -m nn.train \
+    --movi_root   /data/MoVi \
+    --smpl_model  path/to/smpl/models \
+    --output_dir  output/checkpoints \
+    --epochs      100
+```
+
+**3. Evaluate on test sets**
+
+```bash
+# Physics-only baseline
+python scripts/evaluate.py \
+    --dataset     totalcapture \
+    --data_root   /data/tc_processed \
+    --smpl_model  path/to/smpl/models \
+    --output_dir  results/
+
+# With neural correction
+python scripts/evaluate.py \
+    --dataset     totalcapture \
+    --data_root   /data/tc_processed \
+    --smpl_model  path/to/smpl/models \
+    --checkpoint  output/checkpoints/best.pt \
+    --output_dir  results/
 ```
 
 Output files:
