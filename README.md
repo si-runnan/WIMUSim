@@ -41,11 +41,11 @@ Video
 
 ## Installation
 
-### 1. Clone the repo (smpl branch)
+### 1. Clone the repo
 
 ```bash
-git clone -b smpl https://github.com/si-runnan/WIMUSim.git
-cd WIMUSim
+git clone https://github.com/si-runnan/PhyNeSim.git
+cd PhyNeSim
 pip install -e .
 ```
 
@@ -380,7 +380,7 @@ python -m nn.infer \
 ## Project Structure
 
 ```
-WIMUSim/
+PhyNeSim/
 ├── wimusim/                   Core simulation engine
 │   ├── wimusim.py             WIMUSim class (B, D, P, H → IMU)
 │   ├── optimizer.py           Gradient-based parameter identification
@@ -413,7 +413,7 @@ WIMUSim/
 
 ```bibtex
 @article{xxxx,
-  title   = {WIMUSim: Wearable IMU Simulation Framework},
+  title   = {PhyNeSim: Physics-Neural IMU Simulator},
   author  = {xxxx},
   journal = {xxxx},
   year    = {xxxx}
