@@ -127,25 +127,35 @@ class SimulatorDataset(Dataset):
     def generate_data(self):
         """Run WIMUSim on all sequences to produce (pose_6d, phys_imu) pairs."""
         print(f"Generating physics IMU for {len(self.sequences)} sequences...")
+        effective_names: Optional[List[str]] = None
+
         for D, real_imu_dict, B, P, H in tqdm(self.sequences):
             # Physics simulation
             env = WIMUSim(B=B, D=D, P=P, H=H)
             virt = env.simulate(mode="generate")   # {name: (acc, gyro)}
 
-            # Filter to requested IMU names
-            avail = set(virt.keys()) & set(self.imu_names)
+            # Available names: must be present in physics output, real IMU dict,
+            # AND originally requested — preserves consistent ordering.
+            avail = set(virt.keys()) & set(real_imu_dict.keys()) & set(self.imu_names)
             if not avail:
                 continue
 
             names_in_order = [n for n in self.imu_names if n in avail]
+
+            # Lock in the effective sensor list from the first valid sequence so
+            # that all stored tensors have the same channel count.
+            if effective_names is None:
+                effective_names = names_in_order
+            elif names_in_order != effective_names:
+                # Skip sequences where a different sensor set is available.
+                continue
 
             phys_tensor = _stack_imu_dict(
                 {n: virt[n] for n in names_in_order}, names_in_order
             ).detach().cpu()                         # (T, N_imus*6)
 
             real_tensor = _stack_imu_dict(
-                {n: real_imu_dict[n] for n in names_in_order if n in real_imu_dict},
-                [n for n in names_in_order if n in real_imu_dict],
+                {n: real_imu_dict[n] for n in names_in_order}, names_in_order
             )                                        # (T, N_imus*6)
 
             pose_tensor = _extract_pose_6d(D).detach().cpu()  # (T, 24*6)
@@ -161,6 +171,11 @@ class SimulatorDataset(Dataset):
             self._pose_seqs.append(pose_tensor)
             self._phys_seqs.append(phys_tensor)
             self._real_seqs.append(real_tensor)
+
+        # Update imu_names to reflect what was actually available so that
+        # n_imus matches the channel count of all stored tensors.
+        if effective_names is not None:
+            self.imu_names = effective_names
 
         # Build sliding-window index
         self._index_map = []
@@ -207,9 +222,10 @@ class SimulatorDataset(Dataset):
     def from_movi(
         cls,
         amass_root: str,
-        v3d_root: str,
+        v3d_root: Optional[str],
         smpl_model_path: str,
         imu_names: List[str],
+        xsens_root: Optional[str] = None,
         subjects: Optional[List] = None,
         activity_indices: Optional[List[int]] = None,
         window: int = 128,
@@ -217,15 +233,23 @@ class SimulatorDataset(Dataset):
         device: Optional[torch.device] = None,
     ) -> "SimulatorDataset":
         """
-        Build a SimulatorDataset from MoVi data (AMASS BMLmovi + v3d .mat files).
+        Build a SimulatorDataset from MoVi data.
 
         Args:
             amass_root:       Root of AMASS BMLmovi download.
                               Expected layout: Subject_{N}_F_{seq}_poses.npz
                                                (seq = 1..21, one file per activity)
             v3d_root:         Root containing F_v3d_Subject_N.mat files.
+                              - If xsens_root is None: required (IMU + segmentation).
+                              - If xsens_root is set: optional (only for segmentation).
+                                When omitted, activity boundaries are derived from
+                                AMASS file lengths instead.
             smpl_model_path:  Path to SMPL model directory (for compute_B_from_beta).
-            imu_names:        IMU sensor names to include (subset of IMU_NAMES).
+            imu_names:        IMU sensor names to include.
+            xsens_root:       Optional root containing imu_Subject_N.mat files.
+                              When provided, uses real Xsens physical IMU measurements
+                              instead of v3d-derived kinematics as the training target.
+                              Supports 17 IMU positions (includes RSHO/LSHO).
             subjects:         List of subject numbers (integers 1-90).
                               Default: TRAIN_SUBJECTS (subjects 1-60).
             activity_indices: Indices into V3D_MOTION_LIST (0-20). Default: all 21.
@@ -233,6 +257,7 @@ class SimulatorDataset(Dataset):
         from dataset_configs.movi.utils import (
             load_smpl_params,
             load_imu_data,
+            load_xsens_imu,
             generate_default_placement_params,
         )
         from dataset_configs.movi.consts import TRAIN_SUBJECTS, SMPL_SAMPLE_RATE
@@ -256,9 +281,16 @@ class SimulatorDataset(Dataset):
                     betas, global_orient, body_pose, trans = load_smpl_params(
                         amass_root, subject_num, seq_id
                     )
-                    real_imu_dict = load_imu_data(
-                        v3d_root, subject_num, act_idx, imu_names
-                    )
+                    if xsens_root is not None:
+                        real_imu_dict = load_xsens_imu(
+                            xsens_root, subject_num, act_idx,
+                            v3d_root=v3d_root, amass_root=amass_root,
+                            imu_names=imu_names,
+                        )
+                    else:
+                        real_imu_dict = load_imu_data(
+                            v3d_root, subject_num, act_idx, imu_names
+                        )
                 except FileNotFoundError:
                     continue  # Missing file — expected for incomplete datasets
                 except Exception as e:

@@ -2,23 +2,19 @@
 Utility functions for loading MoVi dataset and converting to WIMUSim parameters.
 
 Data layout:
+
     amass_root/
-        Subject_{N}_F_{seq}_poses.npz   poses at 120 Hz (SMPL+H, T×156)
-                                         also contains: betas(16,), trans(T,3)
-                                         seq = 1..21 (V3D_MOTION_LIST order)
+        F_amass_Subject_{N}.mat         all 21 activities per subject, 120 Hz
+        Structure: Subject_N_F_amass['move'][i]:
+            description          : activity name string
+            jointsExpMaps_amass  : (T, 52, 3) axis-angle (joints 0=root, 1-21=body)
+            jointsBetas_amass    : (16,) shape params
+            RootTranslation_amass: (T, 3) root translation in metres
 
-    v3d_root/
-        F_v3d_Subject_{N}.mat            Vicon kinematics at 120 Hz
+    xsens_root/
+        imu_Subject_{N}.mat             real Xsens IMU, 21 joints, 100 Hz
 
-Both sources are at 120 Hz and frame-count aligned per activity.
-
-SMPL+H poses.npz keys:
-    poses:           (T, 156) axis-angle — [:3] global orient, [3:66] body joints 1-21
-    trans:           (T, 3)  root translation
-    betas:           (16,)   shape params
-    mocap_framerate: scalar  (120.0)
-
-v3d .mat structure:
+v3d .mat structure (optional, for activity segmentation):
     Subject_{N}_F['move']:
         jointsTranslation_v3d : (T_all, 15, 3)  mm, 120 Hz, all activities concat'd
         jointsAffine_v3d      : (T_all, 15, 4, 4) rotation+translation, 120 Hz
@@ -38,57 +34,80 @@ import torch
 import pytorch3d.transforms.rotation_conversions as rc
 
 from dataset_configs.movi.consts import (
-    V3D_SAMPLE_RATE, SMPL_SAMPLE_RATE,
+    V3D_SAMPLE_RATE, SMPL_SAMPLE_RATE, XSENS_SAMPLE_RATE,
     V3D_SEGMENT_NAMES, V3D_SEG_TO_IMU, IMU_TO_SEG_IDX,
-    IMU_PARENT_JOINT,
+    IMU_PARENT_JOINT, XSENS_JOINT_TO_IMU,
 )
 from dataset_configs.smpl.utils import _to_rotmat, _rotmat_to_quat_wxyz
 
 
 # ---------------------------------------------------------------------------
-# SMPL parameter loading  (AMASS BMLmovi format)
+# SMPL parameter loading  (F_amass_Subject_N.mat format)
 # ---------------------------------------------------------------------------
+
+# Activity name normalisation: F_amass .mat names → V3D_MOTION_LIST names
+_MAT_TO_V3D_NAME = {
+    "cross_arms":    "crossarms",
+    "jumping_jacks": "jumping_jack",
+    "throw/catch":   "throw_catch",
+    "squatting_rm":  "dancing_rm",   # subject-specific variant of dancing_rm
+}
+
+def _norm_activity_name(name: str) -> str:
+    """Normalise an activity name for matching across data sources."""
+    return _MAT_TO_V3D_NAME.get(name.lower().strip(), name.lower().strip())
+
 
 def load_smpl_params(amass_root: str, subject_num: int, seq_id: int):
     """
-    Load SMPL parameters from an AMASS BMLmovi poses file.
+    Load SMPL parameters for one activity from F_amass_Subject_N.mat.
 
     Args:
-        amass_root:  Root of AMASS BMLmovi download.
+        amass_root:  Root directory containing F_amass_Subject_N.mat files.
         subject_num: Subject number (1-90).
-        seq_id:      Sequence index 1-21 (matches V3D_MOTION_LIST order).
+        seq_id:      Activity index 1-21 (1-indexed, V3D_MOTION_LIST order).
 
     Returns:
         betas:         np.ndarray (10,)
         global_orient: np.ndarray (T, 3, 3)  rotation matrices
-        body_pose:     np.ndarray (T, 23, 3, 3)  joints 1-23 rotation matrices
-                       (joints 22-23 L_HAND/R_HAND set to identity)
+        body_pose:     np.ndarray (T, 23, 3, 3)  (joints 22-23 = identity)
         trans:         np.ndarray (T, 3)  root translation in metres
     """
-    root = Path(amass_root)
+    import scipy.io
+    from dataset_configs.movi.consts import V3D_MOTION_LIST
 
-    # Poses file also contains betas — no separate shape.npz needed
-    poses_path = root / f"Subject_{subject_num}_F_{seq_id}_poses.npz"
-    data  = np.load(str(poses_path))
+    mat_path = Path(amass_root) / f"F_amass_Subject_{subject_num}.mat"
+    mat  = scipy.io.loadmat(str(mat_path), simplify_cells=True)
+    subj = mat[f"Subject_{subject_num}_F_amass"]
 
-    betas = data["betas"][:10].astype(np.float32)        # (10,)
-    trans = data["trans"].astype(np.float32)             # (T, 3) metres
-    poses = data["poses"].astype(np.float32)  # (T, 156)
+    target = _norm_activity_name(V3D_MOTION_LIST[seq_id - 1])
+    move_data = None
+    for move in subj["move"]:
+        if _norm_activity_name(move["description"]) == target:
+            move_data = move
+            break
+    if move_data is None:
+        raise KeyError(
+            f"Activity '{V3D_MOTION_LIST[seq_id - 1]}' not found in {mat_path}"
+        )
 
-    # global_orient: poses[:, :3] axis-angle → rotation matrix
-    global_aa     = torch.tensor(poses[:, :3])
-    global_orient = rc.axis_angle_to_matrix(global_aa).numpy()   # (T, 3, 3)
+    exp_maps = move_data["jointsExpMaps_amass"].astype(np.float32)  # (T, 52, 3)
+    betas    = move_data["jointsBetas_amass"][:10].astype(np.float32)
+    trans    = move_data["RootTranslation_amass"].astype(np.float32)
+    T        = exp_maps.shape[0]
 
-    # body joints 1-21: poses[:, 3:66]
-    T = poses.shape[0]
-    body_aa_21  = torch.tensor(poses[:, 3:66]).reshape(T, 21, 3)
+    global_orient = rc.axis_angle_to_matrix(
+        torch.tensor(exp_maps[:, 0, :])
+    ).numpy()                                                            # (T, 3, 3)
+
     body_rot_21 = rc.axis_angle_to_matrix(
-        body_aa_21.reshape(-1, 3)
-    ).reshape(T, 21, 3, 3)                                         # (T, 21, 3, 3)
+        torch.tensor(exp_maps[:, 1:22, :].reshape(-1, 3))
+    ).numpy().reshape(T, 21, 3, 3)                                       # (T, 21, 3, 3)
 
-    # Pad joints 22-23 (L_HAND, R_HAND) with identity
-    eye       = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(T, 2, -1, -1)
-    body_pose = torch.cat([body_rot_21, eye], dim=1).numpy()       # (T, 23, 3, 3)
+    eye = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(T, 2, -1, -1)
+    body_pose = torch.cat(
+        [torch.tensor(body_rot_21), eye], dim=1
+    ).numpy()                                                            # (T, 23, 3, 3)
 
     return betas, global_orient, body_pose, trans
 
@@ -245,6 +264,131 @@ def load_imu_data(v3d_root: str, subject_num: int, activity_idx: int,
 
         acc, gyro = _compute_segment_imu(global_aff[:, seg_idx], dt_120)
         imu_dict[imu_name] = (acc, gyro)
+
+    return imu_dict
+
+
+# ---------------------------------------------------------------------------
+# Real Xsens IMU loading  (imu_Subject_N.mat)
+# ---------------------------------------------------------------------------
+
+def load_xsens_imu(xsens_root: str, subject_num: int, activity_idx: int,
+                   v3d_root: str = None, amass_root: str = None,
+                   imu_names=None) -> dict:
+    """
+    Load real Xsens IMU measurements for one activity from imu_Subject_N.mat.
+
+    The .mat file stores the full session as a continuous array (S1_Synched).
+    Activity boundaries are determined by one of two methods (in priority order):
+        1. v3d flags120 (if v3d_root is provided) — uses 120 Hz frame boundaries
+           from the Vicon file and converts to 100 Hz Xsens indices.
+        2. AMASS file lengths (if amass_root is provided, v3d_root not given) —
+           each activity's frame count in F_amass_Subject_N.mat × (100/120) gives
+           the Xsens frame count for that activity.
+
+    At least one of v3d_root or amass_root must be provided.
+
+    Data layout inside the .mat (per joint block of 16 columns):
+        [X(3), V(3), Q(4), A(3), W(3)]
+        A = acceleration in g  →  multiply by 9.81 for m/s²
+        W = angular velocity in rad/s  (same unit as WIMUSim)
+
+    Args:
+        xsens_root:   Root directory containing imu_Subject_N.mat files.
+        subject_num:  Subject number (1-90).
+        activity_idx: Activity index 0-20 (into V3D_MOTION_LIST).
+        v3d_root:     Root directory containing F_v3d_Subject_N.mat files
+                      (used only to read flags120 for activity segmentation).
+                      If None, amass_root must be provided instead.
+        amass_root:   Root of AMASS BMLmovi download. Used for segmentation
+                      when v3d_root is not available.
+        imu_names:    Subset of WIMUSim IMU names to return (default: all 17).
+
+    Returns:
+        imu_dict: {wimusim_imu_name: (acc_np, gyro_np)}
+                  acc/gyro shapes (T, 3), units m/s² and rad/s at 120 Hz.
+    """
+    import scipy.io
+
+    # --- Activity boundaries ----------------------------------------------
+    if v3d_root is not None:
+        # Method 1: v3d flags120 (preferred — exact boundaries)
+        v3d_path = Path(v3d_root) / f"F_v3d_Subject_{subject_num}.mat"
+        v3d_mat  = scipy.io.loadmat(str(v3d_path), simplify_cells=True)
+        move     = v3d_mat[f"Subject_{subject_num}_F"]["move"]
+        flags    = move["flags120"]                      # (21, 2) 1-indexed
+        start120 = int(flags[activity_idx, 0]) - 1      # 0-indexed
+        end120   = int(flags[activity_idx, 1])           # exclusive
+        start100 = round(start120 * XSENS_SAMPLE_RATE / V3D_SAMPLE_RATE)
+        end100   = round(end120   * XSENS_SAMPLE_RATE / V3D_SAMPLE_RATE)
+    elif amass_root is not None:
+        # Method 2: derive from AMASS file lengths (no v3d needed)
+        import scipy.io as _sio
+        from dataset_configs.movi.consts import V3D_MOTION_LIST
+        mat_path_a  = Path(amass_root) / f"F_amass_Subject_{subject_num}.mat"
+        lengths_100 = []
+
+        # Read T for each activity in V3D_MOTION_LIST order from F_amass .mat
+        subj = _sio.loadmat(str(mat_path_a), simplify_cells=True)[
+            f"Subject_{subject_num}_F_amass"
+        ]
+        name_to_T = {
+            _norm_activity_name(m["description"]): m["jointsExpMaps_amass"].shape[0]
+            for m in subj["move"]
+        }
+        for v3d_name in V3D_MOTION_LIST:
+            T_120 = name_to_T.get(_norm_activity_name(v3d_name), 0)
+            lengths_100.append(round(T_120 * XSENS_SAMPLE_RATE / V3D_SAMPLE_RATE))
+
+        start100 = sum(lengths_100[:activity_idx])
+        end100   = start100 + lengths_100[activity_idx]
+    else:
+        raise ValueError("Either v3d_root or amass_root must be provided for segmentation.")
+
+    # --- Load Xsens data --------------------------------------------------
+    xsens_path = Path(xsens_root) / f"imu_Subject_{subject_num}.mat"
+    xsens_mat  = scipy.io.loadmat(str(xsens_path))
+    imu_top    = xsens_mat["IMU"][0, 0]
+    s1         = imu_top["S1_Synched"][0, 0]
+
+    data = s1["data"]                                    # (T_session, 336)
+    # Clamp end index to actual data length
+    end100 = min(end100, data.shape[0])
+
+    # Extract activity slice at 100 Hz
+    act_data = data[start100:end100]                     # (T_act_100, 336)
+
+    # Build joint name → column-base-index map
+    joint_names = [s1["jointNames"][0, i][0] for i in range(s1["jointNames"].shape[1])]
+    joint_base  = {name: idx * 16 for idx, name in enumerate(joint_names)}
+
+    # --- Extract acc / gyro per requested IMU ----------------------------
+    requested = imu_names if imu_names is not None else list(XSENS_JOINT_TO_IMU.values())
+    # Build reverse map: wimusim_name → xsens_joint_name
+    imu_to_xsens = {v: k for k, v in XSENS_JOINT_TO_IMU.items()}
+
+    imu_dict_100hz = {}
+    for imu_name in requested:
+        joint_name = imu_to_xsens.get(imu_name)
+        if joint_name is None or joint_name not in joint_base:
+            continue
+        base = joint_base[joint_name]
+        # A channels (g) → m/s²
+        acc  = act_data[:, base + 10 : base + 13].astype(np.float32) * 9.81
+        gyro = act_data[:, base + 13 : base + 16].astype(np.float32)
+        imu_dict_100hz[imu_name] = (acc, gyro)
+
+    # --- Upsample 100 Hz → 120 Hz (linear interp) ----------------------
+    T_100 = act_data.shape[0]
+    T_120 = round(T_100 * V3D_SAMPLE_RATE / XSENS_SAMPLE_RATE)
+    t_100 = np.linspace(0.0, 1.0, T_100)
+    t_120 = np.linspace(0.0, 1.0, T_120)
+
+    imu_dict = {}
+    for imu_name, (acc, gyro) in imu_dict_100hz.items():
+        acc_120  = np.stack([np.interp(t_120, t_100, acc[:, i])  for i in range(3)], axis=1)
+        gyro_120 = np.stack([np.interp(t_120, t_100, gyro[:, i]) for i in range(3)], axis=1)
+        imu_dict[imu_name] = (acc_120.astype(np.float32), gyro_120.astype(np.float32))
 
     return imu_dict
 

@@ -5,10 +5,10 @@ Trains the PhyNeSim neural residual corrector: the network learns to predict
 the residual between WIMUSim physics output and real IMU signals,
 using MoVi paired data (SMPL poses + real IMU).
 
-Usage:
+Usage (with real Xsens IMU as target — recommended):
     python -m nn.train \
         --amass_root     /data/MoVi/amass \
-        --v3d_root       /data/MoVi/v3d \
+        --xsens_root     /data/MoVi/xsens \
         --smpl_model     path/to/smpl/models \
         --imu_names      HED STER PELV RUA LUA RLA LLA RHD LHD RTH LTH RSH LSH RFT LFT \
         --output_dir     output/checkpoints \
@@ -17,6 +17,13 @@ Usage:
         [--epochs        100] \
         [--lr            3e-4] \
         [--wandb_project wimusim_corrector]
+
+Usage (with v3d-derived kinematics as target):
+    python -m nn.train \
+        --amass_root     /data/MoVi/amass \
+        --v3d_root       /data/MoVi/v3d \
+        --smpl_model     path/to/smpl/models \
+        --output_dir     output/checkpoints
 
 Training objective:
     Minimise Smooth L1 loss between corrected IMU and real IMU.
@@ -91,10 +98,11 @@ def physics_baseline(loader, device, n_imus):
 
 def train(
     amass_root: str,
-    v3d_root: str,
     smpl_model: str,
     imu_names: list,
     output_dir: str,
+    v3d_root: str = None,
+    xsens_root: str = None,
     subjects: list = None,
     activity_indices: list = None,
     window: int = 128,
@@ -113,6 +121,9 @@ def train(
     wandb_project: str = None,
     seed: int = 42,
 ):
+    if v3d_root is None and xsens_root is None:
+        raise ValueError("--v3d_root is required when --xsens_root is not provided.")
+
     torch.manual_seed(seed)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     out_dir = Path(output_dir)
@@ -127,6 +138,7 @@ def train(
         v3d_root=v3d_root,
         smpl_model_path=smpl_model,
         imu_names=imu_names,
+        xsens_root=xsens_root,
         subjects=subjects,
         activity_indices=activity_indices,
         window=window,
@@ -264,9 +276,16 @@ def main():
         description="Train PhyNeSim neural residual corrector"
     )
     parser.add_argument("--amass_root", required=True,
-                        help="Root directory of AMASS BMLmovi downloads (Subject_N_F_seq_poses.npz)")
-    parser.add_argument("--v3d_root",   required=True,
-                        help="Root directory of MoVi v3d data (F_v3d_Subject_N.mat)")
+                        help="Root directory of F_amass downloads (F_amass_Subject_N.mat)")
+    parser.add_argument("--v3d_root",   default=None,
+                        help="Root directory of MoVi v3d data (F_v3d_Subject_N.mat). "
+                             "Required when xsens_root is not set. When xsens_root is "
+                             "set, used for activity segmentation (optional — omit to "
+                             "derive boundaries from AMASS file lengths instead).")
+    parser.add_argument("--xsens_root", default=None,
+                        help="Root directory of MoVi Xsens data (imu_Subject_N.mat). "
+                             "When provided, uses real physical IMU as training target "
+                             "instead of v3d-derived kinematics.")
     parser.add_argument("--smpl_model", required=True,
                         help="Path to SMPL model directory (contains SMPL_NEUTRAL.pkl)")
     parser.add_argument("--imu_names",  nargs="+",
@@ -302,6 +321,7 @@ def main():
         smpl_model=args.smpl_model,
         imu_names=args.imu_names,
         output_dir=args.output_dir,
+        xsens_root=args.xsens_root,
         subjects=args.subjects,
         activity_indices=args.activity_indices,
         window=args.window,
