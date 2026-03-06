@@ -1,9 +1,10 @@
 # WIMUSim — SMPL + Neural Network Branch
 
 WIMUSim is a physics-based IMU simulation framework.
-This branch (`smpl-nn`) extends the `smpl` branch with a **Transformer-based
-neural network** that learns to estimate SMPL body pose from raw IMU signals,
-trained entirely on WIMUSim-generated synthetic data.
+This branch (`smpl-nn`) extends the `smpl` branch with a **neural residual corrector**
+that reduces the sim-to-real gap in WIMUSim's physics simulation.
+The network is trained on MoVi paired data (SMPL poses + real IMU) and learns
+to correct the residual between physics output and real sensor measurements.
 
 **Branch strategy**
 
@@ -11,7 +12,7 @@ trained entirely on WIMUSim-generated synthetic data.
 |--------|----------|-------------|-------|
 | `master` | H3.6M (17 joints) | MotionBERT | — |
 | `smpl` | SMPL (24 joints) | HMR2.0 / 4D-Humans | simulation only |
-| `smpl-nn` ← you are here | SMPL (24 joints) | HMR2.0 / 4D-Humans | + pose estimator NN |
+| `smpl-nn` ← you are here | SMPL (24 joints) | HMR2.0 / 4D-Humans | + neural residual corrector |
 
 ---
 
@@ -190,17 +191,30 @@ Optional flags: `--subjects s1 s5`, `--activities walking1 acting1`, `--no_skip`
 
 Download: https://ait.ethz.ch/emdb
 
-Expected structure:
+EMDB provides SMPL-X parameters. Run the preprocessing script to convert them
+to SMPL-compatible format:
+
+```bash
+python -m dataset_configs.emdb.preprocess \
+    --emdb_root /data/EMDB \
+    --output    /data/emdb_processed \
+    --split     EMDB_2          # outdoor split (test set)
+```
+
+Output structure:
 
 ```
-emdb/
-    EMDB_1/          ← indoor
+emdb_processed/
+    EMDB_1/          ← indoor (optional, can use as additional train)
         P1/
             sequence_01.pkl
-    EMDB_2/          ← outdoor (use as test set)
+    EMDB_2/          ← outdoor (test set)
         P1/
             sequence_01.pkl
 ```
+
+Each processed `.pkl` contains `smpl` (betas, global_orient, body_pose) and
+`imu` (acc, gyro) arrays, compatible with `dataset_configs/emdb/utils.py`.
 
 ---
 
@@ -379,16 +393,17 @@ WIMUSim/
 │   ├── totalcapture/          TotalCapture dataset (test)
 │   │   └── preprocess.py      Convert AMASS + raw Xsens → smpl.npz + imu.pkl
 │   └── emdb/                  EMDB dataset (test)
+│       └── preprocess.py      Convert SMPL-X → SMPL-compatible format
 ├── pipeline/
 │   ├── video_to_smpl.py       HMR2.0 wrapper: video → SMPL params
 │   ├── run.py                 End-to-end: video → virtual IMU (CLI)
 │   ├── resample.py            Sample rate alignment (SLERP + linear interp)
 │   └── evaluate.py            Evaluation metrics (RMSE, MAE, Pearson)
-├── nn/                        Neural network (smpl-nn branch)
-│   ├── model.py               PoseEstimator (Transformer) + rotation utils
-│   ├── dataset.py             PoseEstimDataset — CPM → IMU/pose pairs
-│   ├── train.py               Training script (CLI)
-│   └── infer.py               Inference on real IMU data (CLI)
+├── nn/                        Neural residual corrector (smpl-nn branch)
+│   ├── model.py               NeuralSimulator (Transformer) + rotation utils
+│   ├── dataset.py             SimulatorDataset — MoVi pose+IMU pairs
+│   ├── train.py               Training script — MoVi paired data (CLI)
+│   └── infer.py               corrected_simulate() drop-in for WIMUSim (CLI)
 └── examples/                  Jupyter notebooks
 ```
 

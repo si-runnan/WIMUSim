@@ -5,13 +5,11 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="wimusim",
-    version="0.1.0",
-    author="Nobuyuki Oishi",
-    author_email="n.oishi@sussex.ac.uk",
-    description="A Python package for Wearable IMU Simulation framework (WIMUSim)",
+    version="0.2.0",
+    description="WIMUSim — Wearable IMU Simulation Framework (SMPL branch)",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/NobuyukiOISHI/WIMUSim",
+    url="https://github.com/si-runnan/WIMUSim",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",
