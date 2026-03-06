@@ -267,78 +267,87 @@ SMPL rotation matrices are resampled with SLERP; IMU signals use linear interpol
 
 ---
 
-## Neural Network: IMU → SMPL Pose
+## Neural Residual Corrector for WIMUSim
 
-The `nn/` package provides a Transformer encoder that maps raw IMU signals
-to SMPL body_pose (23 joint rotation matrices), trained on WIMUSim synthetic data.
+Physics-based simulation has a **sim-to-real gap**: WIMUSim's rigid-body model
+cannot perfectly replicate soft-tissue artefacts, non-linear sensor characteristics,
+and complex noise patterns found in real IMUs.
 
-### Architecture
+The `nn/` package provides a Transformer-based **neural residual corrector**
+trained on MoVi paired data (SMPL poses + real IMU) to bridge this gap.
+
+### How it works
 
 ```
-raw IMU (acc+gyro per sensor)            (B, T, N_imus × 6)
-    → Linear projection
-    → Sinusoidal positional encoding
-    → Transformer Encoder  ×4 layers
-    → MLP pose head
-    → 6D rotation                        (B, T, 23 × 6)
-    → Gram-Schmidt orthonormalization
-    → rotation matrices                  (B, T, 23, 3, 3)
+SMPL pose  →  WIMUSim (physics)  →  phys_imu
+     │                                  │
+     └──────────── concat ───────────────┘
+                       │
+              Transformer Encoder
+                       │
+                   residual                    (learned sim-to-real correction)
+                       │
+        phys_imu + residual  =  corrected_imu  ≈  real IMU
 ```
 
-Loss: **geodesic (angular) loss** — average rotation angle error between
-predicted and ground-truth rotation matrices.
+Physics provides a strong, interpretable prior.
+The network only needs to model the remaining gap — a much smaller learning task.
 
-### Step 1 — Parameter identification (smpl branch prerequisite)
+Loss: **Smooth L1** on acc and gyro channels separately (different physical scales).
+The training log reports improvement over the physics-only baseline, e.g.:
 
-Run `examples/parameter_identification.ipynb` over all MoVi subjects to
-produce `cpm_params_movi.pkl`.
+```
+Physics-only baseline loss: 0.3841
+Epoch  50  train 0.1203  val 0.1389  (+63.8% vs physics)
+```
 
-### Step 2 — Train
+### Step 1 — Train on MoVi
 
 ```bash
 python -m nn.train \
-    --cpm_pkl    output/cpm_params_movi.pkl \
+    --movi_root  /data/MoVi \
+    --smpl_model path/to/smpl/models \
+    --imu_names  HED STER PELV RUA LUA RLA LLA RHD LHD RTH LTH RSH LSH RFT LFT \
     --output_dir output/checkpoints \
-    --n_combinations 500 \
-    --epochs 100 \
-    --wandb_project wimusim_pose
+    --epochs     100 \
+    --wandb_project wimusim_corrector
 ```
 
 Key arguments:
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--n_combinations` | 500 | CPM (B,D,P,H) combinations to simulate |
 | `--window` | 128 | Sliding window length (frames) |
 | `--d_model` | 256 | Transformer hidden dim |
 | `--n_layers` | 4 | Number of Transformer layers |
 | `--epochs` | 100 | Training epochs |
-| `--wandb_project` | None | W&B project (omit to disable) |
+| `--wandb_project` | None | W&B project name (omit to disable) |
+| `--no_residual` | — | Direct mode: predict IMU from pose only |
 
 Checkpoints saved to `output/checkpoints/best.pt` and `last.pt`.
 
-### Step 3 — Inference on real IMU
+### Step 2 — Use as drop-in for WIMUSim.simulate()
+
+```python
+from nn.infer import corrected_simulate
+
+# Same B, D, P, H as WIMUSim.simulate()
+imu_dict = corrected_simulate(
+    checkpoint="output/checkpoints/best.pt",
+    B=B, D=D, P=P, H=H,
+)
+# Returns {imu_name: (acc, gyro)} — identical format to WIMUSim output
+acc_RLA, gyro_RLA = imu_dict["RLA"]
+```
+
+### Step 3 — CLI inference
 
 ```bash
 python -m nn.infer \
-    --checkpoint  output/checkpoints/best.pt \
-    --imu_pkl     /data/tc_processed/s5/walking1/imu.pkl \
-    --imu_names   HED STER PELV RUA LUA RLA LLA RHD LHD RTH LTH RSH LSH \
-    --output      output/pred_pose.npz
-```
-
-Output `pred_pose.npz` contains `body_pose` of shape `(T, 23, 3, 3)`.
-
-### Use in Python
-
-```python
-import torch
-from nn.model import PoseEstimator
-
-model = PoseEstimator(n_imus=13, d_model=256, n_heads=4, n_layers=4)
-
-# imu: torch.Tensor (B, T, 13 * 6)  — acc+gyro concatenated per sensor
-body_pose = model(imu)   # (B, T, 23, 3, 3)
+    --checkpoint output/checkpoints/best.pt \
+    --smpl_npz   smpl_params.npz \
+    --smpl_model path/to/smpl/models \
+    --output     output/corrected_imu.npz
 ```
 
 ---

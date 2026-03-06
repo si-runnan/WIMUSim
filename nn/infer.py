@@ -1,135 +1,152 @@
 """
-Inference: real IMU data → SMPL body_pose.
+Inference: augment WIMUSim physics simulation with neural correction.
+
+Given SMPL poses, runs WIMUSim physics first, then applies the neural
+residual corrector to produce more accurate virtual IMU signals.
 
 Usage:
     python -m nn.infer \
         --checkpoint  output/checkpoints/best.pt \
-        --imu_pkl     /data/tc_processed/s5/walking1/imu.pkl \
-        --imu_names   HED STER PELV RUA LUA RLA LLA RHD LHD RTH LTH RSH LSH \
-        --output      output/pred_pose.npz
+        --smpl_npz    /data/movi/F_Subject01/F_Subject01_walk01_poses.npz \
+        --smpl_model  path/to/smpl/models \
+        --output      output/corrected_imu.npz
 
-Input IMU format (imu.pkl):
-    {imu_name: {'acc': np.ndarray (T,3), 'gyro': np.ndarray (T,3)}}
+Or use as a drop-in replacement for WIMUSim.simulate() in Python:
 
-Output (pred_pose.npz):
-    body_pose: np.ndarray (T, 23, 3, 3)  — predicted rotation matrices
+    from nn.infer import corrected_simulate
+
+    imu_dict = corrected_simulate(
+        checkpoint="output/checkpoints/best.pt",
+        B=B, D=D, P=P, H=H,
+    )
+    # imu_dict: {imu_name: (acc, gyro)}  — same format as WIMUSim.simulate()
 """
 
 import argparse
 import pickle
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
-from nn.model import PoseEstimator
-from dataset_configs.smpl.consts import SMPL_BODY_POSE_JOINT_NAMES
+from nn.model import NeuralSimulator, quat_wxyz_to_rot6d
+from nn.dataset import JOINT_ORDER, _stack_imu_dict
+from wimusim.wimusim import WIMUSim
 
 
 # ---------------------------------------------------------------------------
-# Loading helpers
+# Load model
 # ---------------------------------------------------------------------------
 
-def load_checkpoint(ckpt_path: str, device: torch.device) -> tuple:
-    """
-    Load a PoseEstimator from a checkpoint file.
-
-    Returns:
-        (model, config)
-    """
+def load_checkpoint(ckpt_path: str, device: torch.device) -> Tuple[NeuralSimulator, dict]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg  = ckpt["config"]
-    model = PoseEstimator(
+    model = NeuralSimulator(
         n_imus=cfg["n_imus"],
         d_model=cfg.get("d_model", 256),
         n_heads=cfg.get("n_heads", 4),
         n_layers=cfg.get("n_layers", 4),
         d_ff=cfg.get("d_ff", 512),
-        dropout=0.0,   # inference — no dropout
+        dropout=0.0,
+        residual=cfg.get("residual", True),
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, cfg
 
 
-def load_imu_pkl(pkl_path: str, imu_names: List[str]) -> np.ndarray:
-    """
-    Load IMU data from a .pkl file and stack into (T, N_imus * 6).
-
-    Args:
-        pkl_path:  Path to imu.pkl
-        imu_names: Ordered list of IMU names to use (must match training order).
-
-    Returns:
-        np.ndarray (T, N_imus * 6)  float32
-    """
-    with open(pkl_path, "rb") as f:
-        raw = pickle.load(f, encoding="latin1")
-
-    arrays = []
-    for name in imu_names:
-        if name not in raw:
-            raise KeyError(f"IMU '{name}' not found in {pkl_path}. "
-                           f"Available: {list(raw.keys())}")
-        d = raw[name]
-        acc  = np.asarray(d["acc"],  dtype=np.float32)   # (T, 3)
-        gyro = np.asarray(d["gyro"], dtype=np.float32)   # (T, 3)
-        arrays.append(np.concatenate([acc, gyro], axis=-1))  # (T, 6)
-
-    return np.concatenate(arrays, axis=-1)   # (T, N_imus * 6)
-
-
 # ---------------------------------------------------------------------------
-# Sliding-window inference
+# Core inference function
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def infer(
-    model: PoseEstimator,
-    imu: np.ndarray,
-    window: int,
-    stride: int,
-    device: torch.device,
-) -> np.ndarray:
+def corrected_simulate(
+    checkpoint: str,
+    B: "WIMUSim.Body",
+    D: "WIMUSim.Dynamics",
+    P: "WIMUSim.Placement",
+    H: "WIMUSim.Hardware",
+    window: Optional[int] = None,
+    stride: int = 32,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    Run sliding-window inference and average overlapping predictions.
+    Drop-in replacement for WIMUSim.simulate() with neural correction.
+
+    Runs WIMUSim physics, then applies the neural residual corrector,
+    returning corrected virtual IMU signals in the same format.
 
     Args:
-        imu:    (T, N_imus * 6)  float32
-        window: same as used during training
-        stride: step between windows (can differ from training stride)
+        checkpoint: Path to trained checkpoint (.pt file).
+        B, D, P, H: WIMUSim parameters (same as WIMUSim.simulate()).
+        window:     Sliding window size. Uses value from checkpoint if None.
+        stride:     Inference stride between windows.
+        device:     Torch device.
 
     Returns:
-        body_pose: (T, 23, 3, 3)  float32
+        {imu_name: (acc, gyro)}  — corrected virtual IMU, same as WIMUSim output.
     """
-    T = imu.shape[0]
-    imu_t = torch.from_numpy(imu).to(device)
+    dev = device or (
+        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    )
 
-    # Accumulator for averaging overlapping windows
-    acc   = torch.zeros(T, 23, 3, 3, device=device)
-    count = torch.zeros(T, 1, 1, 1,  device=device)
+    model, cfg = load_checkpoint(checkpoint, dev)
+    win = window or cfg["window"]
+    imu_names = cfg["imu_names"]
 
-    for start in range(0, T - window + 1, stride):
-        end = start + window
-        x = imu_t[start:end].unsqueeze(0)        # (1, T_win, N_imus*6)
-        pred = model(x).squeeze(0)               # (T_win, 23, 3, 3)
-        acc[start:end]   += pred
-        count[start:end] += 1.0
+    # --- Physics simulation ---
+    env  = WIMUSim(B=B, D=D, P=P, H=H)
+    virt = env.simulate(mode="generate")   # {name: (acc, gyro)}
 
-    # Handle the tail (last incomplete stride that wasn't covered)
-    if T > window:
-        start = T - window
-        x = imu_t[start:].unsqueeze(0)
-        pred = model(x).squeeze(0)
-        mask = count[start:] == 0
-        acc[start:][mask.expand_as(acc[start:])] = \
-            pred[mask.squeeze(-1).squeeze(-1)]
-        count[start:][count[start:] == 0] = 1.0
+    avail = [n for n in imu_names if n in virt]
+    phys_tensor = _stack_imu_dict(
+        {n: virt[n] for n in avail}, avail
+    ).unsqueeze(0)                          # (1, T, N*6)
 
-    count = count.clamp(min=1.0)
-    body_pose = (acc / count).cpu().numpy().astype(np.float32)
-    return body_pose
+    # --- Pose features ---
+    T = phys_tensor.shape[1]
+    pose_feats = []
+    for joint in JOINT_ORDER:
+        q = D.orientation.get(joint)
+        if q is None:
+            q = torch.zeros(T, 4, device=dev); q[:, 0] = 1.0
+        pose_feats.append(quat_wxyz_to_rot6d(q.to(dev)))
+    pose_tensor = torch.cat(pose_feats, dim=-1).unsqueeze(0)  # (1, T, 24*6)
+
+    # --- Sliding-window inference with overlap averaging ---
+    n_ch  = phys_tensor.shape[-1]
+    acc_c = torch.zeros(1, T, n_ch, device=dev)
+    cnt   = torch.zeros(1, T, 1,    device=dev)
+
+    phys_d = phys_tensor.to(dev)
+    pose_d = pose_tensor.to(dev)
+
+    for start in range(0, T - win + 1, stride):
+        end  = start + win
+        pred = model(pose_d[:, start:end], phys_d[:, start:end])
+        acc_c[:, start:end] += pred
+        cnt[:, start:end]   += 1.0
+
+    # Handle tail
+    if T > win and cnt[:, -1, 0] == 0:
+        start = T - win
+        pred  = model(pose_d[:, start:], phys_d[:, start:])
+        acc_c[:, start:] += pred
+        cnt[:, start:]   += 1.0
+
+    cnt = cnt.clamp(min=1.0)
+    corrected = (acc_c / cnt).squeeze(0)   # (T, N*6)
+
+    # --- Unpack back into {name: (acc, gyro)} ---
+    result = {}
+    for i, name in enumerate(avail):
+        base = i * 6
+        result[name] = (
+            corrected[:, base:base+3].cpu(),
+            corrected[:, base+3:base+6].cpu(),
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -138,52 +155,74 @@ def infer(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="IMU → SMPL body_pose inference"
+        description="WIMUSim + neural corrector inference"
     )
-    parser.add_argument("--checkpoint", required=True,
-                        help="Path to checkpoint .pt file")
-    parser.add_argument("--imu_pkl", required=True,
-                        help="Path to imu.pkl with real IMU data")
-    parser.add_argument("--imu_names", nargs="+", required=True,
-                        help="Ordered IMU names (must match training order)")
-    parser.add_argument("--output", default="output/pred_pose.npz",
-                        help="Output .npz path")
-    parser.add_argument("--stride", type=int, default=32,
-                        help="Inference stride (default: 32 frames)")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--checkpoint",  required=True,
+                        help="Path to trained checkpoint")
+    parser.add_argument("--smpl_npz",   required=True,
+                        help="Path to SMPL params .npz "
+                             "(keys: betas, global_orient, body_pose)")
+    parser.add_argument("--smpl_model", required=True,
+                        help="Path to SMPL model directory")
+    parser.add_argument("--output",     default="output/corrected_imu.npz")
+    parser.add_argument("--stride",     type=int, default=32)
+    parser.add_argument("--device",     default="cuda")
+    parser.add_argument("--gender",     default="neutral",
+                        choices=["neutral", "male", "female"])
     args = parser.parse_args()
+
+    import numpy as np
+    from dataset_configs.smpl.utils import compute_B_from_beta, smpl_pose_to_D_orientation
+    from dataset_configs.movi.utils import generate_default_placement_params
+    from wimusim import utils as wu
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    print(f"Loading checkpoint: {args.checkpoint}")
-    model, cfg = load_checkpoint(args.checkpoint, device)
-    window = cfg["window"]
-    print(f"  Window: {window} frames  |  IMUs: {cfg['n_imus']}")
+    # Load SMPL params
+    data = np.load(args.smpl_npz)
+    betas        = data["betas"]
+    global_orient = data["global_orient"]
+    body_pose    = data["body_pose"]
 
-    print(f"Loading IMU data: {args.imu_pkl}")
-    imu = load_imu_pkl(args.imu_pkl, args.imu_names)
-    T = imu.shape[0]
-    print(f"  {T} frames × {imu.shape[1]} channels")
+    # Build WIMUSim params
+    B_rp = compute_B_from_beta(betas, smpl_model_path=args.smpl_model,
+                                gender=args.gender)
+    orientation = smpl_pose_to_D_orientation(global_orient, body_pose)
 
-    if T < window:
-        # Pad with reflection
-        pad = window - T
-        imu = np.concatenate([imu, imu[-pad:][::-1]], axis=0)
-        print(f"  (padded to {imu.shape[0]} frames)")
+    def _to_tensor(d):
+        return {k: torch.tensor(v, dtype=torch.float32, device=device)
+                for k, v in d.items()}
 
-    print("Running inference...")
-    body_pose = infer(model, imu, window=window, stride=args.stride, device=device)
-    body_pose = body_pose[:T]   # trim any padding
+    B = WIMUSim.Body(rp=_to_tensor(B_rp), device=device)
+    D = WIMUSim.Dynamics(orientation=_to_tensor(orientation), device=device)
 
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    imu_names = ckpt["config"]["imu_names"]
+    P_all = generate_default_placement_params(B_rp)
+    P = WIMUSim.Placement(
+        rp=_to_tensor({k: v for k, v in P_all["rp"].items() if k[1] in imu_names}),
+        ro=_to_tensor({k: v for k, v in P_all["ro"].items() if k[1] in imu_names}),
+        device=device,
+    )
+    H = wu.generate_default_H_configs(imu_names, device=device)
+
+    print("Running corrected simulation...")
+    imu_dict = corrected_simulate(
+        checkpoint=args.checkpoint,
+        B=B, D=D, P=P, H=H,
+        stride=args.stride,
+        device=device,
+    )
+
+    # Save
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        str(out_path),
-        body_pose=body_pose,
-        imu_names=args.imu_names,
-        joint_names=SMPL_BODY_POSE_JOINT_NAMES,
-    )
-    print(f"Saved: {out_path}  (body_pose: {body_pose.shape})")
+    save_data = {}
+    for name, (acc, gyro) in imu_dict.items():
+        save_data[f"{name}_acc"]  = acc.numpy()
+        save_data[f"{name}_gyro"] = gyro.numpy()
+    np.savez(str(out_path), **save_data)
+    print(f"Saved corrected IMU to {out_path}")
 
 
 if __name__ == "__main__":

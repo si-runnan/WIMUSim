@@ -1,3 +1,10 @@
-from nn.model import PoseEstimator, rot6d_to_rotmat, rotmat_to_rot6d, geodesic_loss
+from nn.model import NeuralSimulator, simulator_loss, quat_wxyz_to_rot6d, rotmat_to_rot6d
+from nn.infer import corrected_simulate
 
-__all__ = ["PoseEstimator", "rot6d_to_rotmat", "rotmat_to_rot6d", "geodesic_loss"]
+__all__ = [
+    "NeuralSimulator",
+    "simulator_loss",
+    "quat_wxyz_to_rot6d",
+    "rotmat_to_rot6d",
+    "corrected_simulate",
+]
