@@ -1,15 +1,17 @@
-# WIMUSim — SMPL Branch
+# WIMUSim — SMPL + Neural Network Branch
 
 WIMUSim is a physics-based IMU simulation framework.
-This branch (`smpl`) uses **SMPL body model** as the skeleton format,
-enabling direct integration with video-based pose estimators (HMR2.0 / 4D-Humans).
+This branch (`smpl-nn`) extends the `smpl` branch with a **Transformer-based
+neural network** that learns to estimate SMPL body pose from raw IMU signals,
+trained entirely on WIMUSim-generated synthetic data.
 
 **Branch strategy**
 
-| Branch | Skeleton | Pose source |
-|--------|----------|-------------|
-| `master` | H3.6M (17 joints) | MotionBERT |
-| `smpl` ← you are here | SMPL (24 joints) | HMR2.0 / 4D-Humans |
+| Branch | Skeleton | Pose source | Extra |
+|--------|----------|-------------|-------|
+| `master` | H3.6M (17 joints) | MotionBERT | — |
+| `smpl` | SMPL (24 joints) | HMR2.0 / 4D-Humans | simulation only |
+| `smpl-nn` ← you are here | SMPL (24 joints) | HMR2.0 / 4D-Humans | + pose estimator NN |
 
 ---
 
@@ -265,6 +267,82 @@ SMPL rotation matrices are resampled with SLERP; IMU signals use linear interpol
 
 ---
 
+## Neural Network: IMU → SMPL Pose
+
+The `nn/` package provides a Transformer encoder that maps raw IMU signals
+to SMPL body_pose (23 joint rotation matrices), trained on WIMUSim synthetic data.
+
+### Architecture
+
+```
+raw IMU (acc+gyro per sensor)            (B, T, N_imus × 6)
+    → Linear projection
+    → Sinusoidal positional encoding
+    → Transformer Encoder  ×4 layers
+    → MLP pose head
+    → 6D rotation                        (B, T, 23 × 6)
+    → Gram-Schmidt orthonormalization
+    → rotation matrices                  (B, T, 23, 3, 3)
+```
+
+Loss: **geodesic (angular) loss** — average rotation angle error between
+predicted and ground-truth rotation matrices.
+
+### Step 1 — Parameter identification (smpl branch prerequisite)
+
+Run `examples/parameter_identification.ipynb` over all MoVi subjects to
+produce `cpm_params_movi.pkl`.
+
+### Step 2 — Train
+
+```bash
+python -m nn.train \
+    --cpm_pkl    output/cpm_params_movi.pkl \
+    --output_dir output/checkpoints \
+    --n_combinations 500 \
+    --epochs 100 \
+    --wandb_project wimusim_pose
+```
+
+Key arguments:
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--n_combinations` | 500 | CPM (B,D,P,H) combinations to simulate |
+| `--window` | 128 | Sliding window length (frames) |
+| `--d_model` | 256 | Transformer hidden dim |
+| `--n_layers` | 4 | Number of Transformer layers |
+| `--epochs` | 100 | Training epochs |
+| `--wandb_project` | None | W&B project (omit to disable) |
+
+Checkpoints saved to `output/checkpoints/best.pt` and `last.pt`.
+
+### Step 3 — Inference on real IMU
+
+```bash
+python -m nn.infer \
+    --checkpoint  output/checkpoints/best.pt \
+    --imu_pkl     /data/tc_processed/s5/walking1/imu.pkl \
+    --imu_names   HED STER PELV RUA LUA RLA LLA RHD LHD RTH LTH RSH LSH \
+    --output      output/pred_pose.npz
+```
+
+Output `pred_pose.npz` contains `body_pose` of shape `(T, 23, 3, 3)`.
+
+### Use in Python
+
+```python
+import torch
+from nn.model import PoseEstimator
+
+model = PoseEstimator(n_imus=13, d_model=256, n_heads=4, n_layers=4)
+
+# imu: torch.Tensor (B, T, 13 * 6)  — acc+gyro concatenated per sensor
+body_pose = model(imu)   # (B, T, 23, 3, 3)
+```
+
+---
+
 ## Example Notebooks
 
 | Notebook | What it does |
@@ -297,6 +375,11 @@ WIMUSim/
 │   ├── run.py                 End-to-end: video → virtual IMU (CLI)
 │   ├── resample.py            Sample rate alignment (SLERP + linear interp)
 │   └── evaluate.py            Evaluation metrics (RMSE, MAE, Pearson)
+├── nn/                        Neural network (smpl-nn branch)
+│   ├── model.py               PoseEstimator (Transformer) + rotation utils
+│   ├── dataset.py             PoseEstimDataset — CPM → IMU/pose pairs
+│   ├── train.py               Training script (CLI)
+│   └── infer.py               Inference on real IMU data (CLI)
 └── examples/                  Jupyter notebooks
 ```
 
